@@ -23,17 +23,16 @@ from tensorflow_datasets.rl_unplugged import atari_utils
 from tensorflow_datasets.rl_unplugged import rlu_common
 
 
-class RluAtari(rlu_common.RLUBuilder):
-  """DatasetBuilder for RLU Atari."""
+class RluAtariCheckpoints(rlu_common.RLUBuilder):
+  """DatasetBuilder for RLU Atari with one split per checkpoint."""
 
   _SHARDS = 50
+  _SPLITS = 50
   _INPUT_FILE_PREFIX = 'gs://rl_unplugged/atari_episodes_ordered'
 
-  VERSION = tfds.core.Version('1.2.0')
+  VERSION = tfds.core.Version('1.0.0')
   RELEASE_NOTES = {
       '1.0.0': 'Initial release.',
-      '1.1.0': 'Added is_last.',
-      '1.2.0': 'Added checkpoint id'
   }
 
   BUILDER_CONFIGS = atari_utils.builder_configs()
@@ -61,3 +60,14 @@ class RluAtari(rlu_common.RLUBuilder):
   def tf_example_to_step_ds(self,
                             tf_example: tf.train.Example) -> Dict[str, Any]:
     return atari_utils.atari_example_to_rlds(tf_example)
+
+  def get_splits(self, paths):
+    checkpoints = {}
+    num_splits = atari_utils.num_shards(self.builder_config.game, self._SPLITS)
+    for i in range(num_splits):
+      checkpoints[f'checkpoint_{i}'] = self._generate_examples(paths, i)
+    return checkpoints
+
+  def belongs_to_split(self, episode, split_id):
+    return episode['checkpoint_id'] == split_id
+
