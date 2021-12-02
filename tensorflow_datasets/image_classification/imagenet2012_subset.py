@@ -19,7 +19,7 @@ import io
 import os
 
 import tensorflow as tf
-from tensorflow_datasets.image_classification.imagenet import Imagenet2012
+import tensorflow_datasets.image_classification.imagenet as imagenet
 import tensorflow_datasets.public_api as tfds
 
 _DESCRIPTION = """\
@@ -65,7 +65,7 @@ SUBSET2FILES = {
 }
 
 
-class Imagenet2012Subset(Imagenet2012):
+class Imagenet2012Subset(imagenet.Imagenet2012):
   """Class balanced subset of Imagenet 2012 dataset."""
 
   BUILDER_CONFIGS = [
@@ -122,7 +122,7 @@ class Imagenet2012Subset(Imagenet2012):
             name=tfds.Split.VALIDATION,
             gen_kwargs={
                 'archive': dl_manager.iter_archive(val_path),
-                'validation_labels': self._get_validation_labels(val_path),
+                'validation_labels': imagenet.get_validation_labels(val_path),
             },
         ),
     ]
@@ -130,7 +130,7 @@ class Imagenet2012Subset(Imagenet2012):
   def _generate_examples(self, archive, subset=None, validation_labels=None):
     """Yields examples."""
     if validation_labels:  # Validation split
-      for key, example in self._generate_examples_validation(
+      for key, example in imagenet.generate_examples_validation(
           archive, validation_labels):
         yield key, example
     # Training split. Main archive contains archives names after a synset noun.
