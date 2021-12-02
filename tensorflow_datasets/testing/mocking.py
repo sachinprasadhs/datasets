@@ -20,7 +20,7 @@ import enum
 import functools
 import os
 import random
-from typing import Callable, Iterator, Optional
+from typing import Any, Callable, Generic, Iterable, Iterator, List, Mapping, MutableMapping, Optional, TypeVar
 from unittest import mock
 
 from absl import logging
@@ -33,6 +33,8 @@ from tensorflow_datasets.core import features as features_lib
 from tensorflow_datasets.core import read_only_builder
 from tensorflow_datasets.core import tfrecords_reader
 from tensorflow_datasets.testing import test_utils
+
+T = TypeVar('T')
 
 
 class MockPolicy(enum.Enum):
@@ -53,6 +55,31 @@ class MockPolicy(enum.Enum):
   USE_FILES = enum.auto()
 
 
+class DataGenerator:
+  """Abstract base class for data generators.
+
+  If the generated data has certain constraints, then a DataGenerator subclass
+  can be generated and passed to mock_data.
+  """
+
+  def __init__(self,
+               shape: Optional[Any] = None,
+               dtype: Optional[tf.DType] = None):
+    self._shape_spec = shape
+    self._dtype = dtype
+    if dtype:
+      self._numpy_dtype = dtype.as_numpy_dtype
+    else:
+      self._numpy_dtype = None
+
+  def generate_shape(self, py_rng: random.Random):
+    # Fill dynamic shape with random values
+    return [py_rng.randint(5, 50) if s is None else s for s in self._shape_spec]
+
+  def generate(self, py_rng: random.Random, rgn: np.random.RandomState) -> Any:
+    raise NotImplementedError
+
+
 @contextlib.contextmanager
 def mock_data(
     num_examples: int = 1,
@@ -61,6 +88,7 @@ def mock_data(
     policy: MockPolicy = MockPolicy.AUTO,
     as_dataset_fn: Optional[Callable[..., tf.data.Dataset]] = None,
     data_dir: Optional[str] = None,
+    custom_generators: Optional[Mapping[str, DataGenerator]] = None,
 ) -> Iterator[None]:
   """Mock tfds to generate random data.
 
@@ -210,7 +238,8 @@ def mock_data(
         lambda: generator_cls(
             features=features,
             num_examples=num_examples,
-            num_sub_examples=num_sub_examples),
+            num_sub_examples=num_sub_examples,
+            custom_generators=custom_generators),
         # pylint: enable=g-long-lambda]
         output_types=tf.nest.map_structure(lambda t: t.dtype, specs),
         output_shapes=tf.nest.map_structure(lambda t: t.shape, specs),
@@ -285,89 +314,201 @@ def mock_data(
     yield
 
 
+class SpecificValueGenerator(DataGenerator, Generic[T]):
+  """Randomly picks elements from a given list."""
+
+  def __init__(self, shape: Optional[Any], allowed_values: Iterable[T],
+               dtype: Optional[tf.DType]):
+    super().__init__(shape, dtype)
+    self._allowed_values: List[T] = list(allowed_values)
+
+  def generate(self, py_rng: random.Random, rgn: np.random.RandomState) -> T:
+    shape = self.generate_shape(py_rng)
+    return rgn.choice(
+        self._allowed_values, size=shape).astype(self._numpy_dtype)
+
+  def __repr__(self):
+    return f'SpecificValueGenerator(shape={self._shape_spec}, allowed_values={self._allowed_values})'
+
+
+class IntInRangeGenerator(DataGenerator):
+  """Generates integers in a specified range."""
+
+  def __init__(
+      self,
+      shape: Optional[Any],
+      dtype: Optional[tf.DType] = tf.int64,
+      min_value: int = 0,
+      max_value: int = 255,
+  ):
+    self._min_value = min_value
+    self._max_value = max_value
+    super().__init__(shape, dtype)
+
+  def generate(self, py_rng: random.Random, rgn: np.random.RandomState) -> int:
+    shape = self.generate_shape(py_rng)
+    return rgn.randint(self._min_value, self._max_value,
+                       shape).astype(self._numpy_dtype)
+
+  def __repr__(self):
+    return f'IntInRangeGenerator(min={self._min_value}, max={self._max_value}, shape={self._shape_spec})'
+
+
+class StringGenerator(DataGenerator):
+  """Random string generator."""
+
+  def __init__(self,
+               shape: Optional[Any] = None,
+               min_chars: int = 10,
+               max_chars: int = 20,
+               allowable_chars: str = ' abcdefghij'):
+    self._min_chars = min_chars
+    self._max_chars = max_chars
+    self._allowable_chars = list(allowable_chars)
+    super().__init__(shape, None)
+
+  def generate(self, py_rng: random.Random, rgn: np.random.RandomState) -> str:
+    """Generates an array of random strings."""
+
+    def rand_str():
+      return ''.join(
+          rgn.choice(
+              self._allowable_chars,
+              size=(py_rng.randint(self._min_chars, self._max_chars))))
+
+    if not self._shape_spec:
+      return rand_str()
+
+    shape = self.generate_shape(py_rng)
+    return np.array([rand_str() for _ in range(np.prod(shape, dtype=np.int32))
+                    ]).reshape(shape)
+
+  def __repr__(self):
+    return f'StringGenerator(shape={self._shape_spec}, num_chars=[{self._min_chars}, {self._max_chars}])'
+
+
+class FloatGenerator(DataGenerator):
+  """Generates random floats in the half-open interval [0.0, 1.0)."""
+
+  def generate(self, py_rng: random.Random,
+               rgn: np.random.RandomState) -> float:
+    shape = self.generate_shape(py_rng)
+    return rgn.random_sample(shape).astype(self._numpy_dtype)
+
+  def __repr__(self):
+    return f'FloatGenerator(shape={self._shape_spec})'
+
+
+class BoolGenerator(DataGenerator):
+
+  def generate(self, py_rng: random.Random, rgn: np.random.RandomState) -> bool:
+    shape = self.generate_shape(py_rng)
+    return (rgn.random_sample(shape) < .5).astype(self._numpy_dtype)
+
+  def __repr__(self):
+    return f'BoolGenerator(shape={self._shape_spec})'
+
+
+class DatasetGenerator(DataGenerator):
+  """Generator for datasets."""
+
+  def __init__(self,
+               features: features_lib.FeaturesDict,
+               num_sub_examples: int = 1,
+               custom_generators: Optional[Mapping[str, DataGenerator]] = None):
+    self._features = features
+    self._num_sub_examples = num_sub_examples
+    custom_generators = custom_generators or {}
+    self._feature_generators = {}
+    for feature_name, feature in self._features.items():
+      self._feature_generators[feature_name] = custom_generators.get(
+          feature_name,
+          data_generator_for(
+              feature,
+              num_sub_examples=num_sub_examples,
+              custom_generators=custom_generators))
+    super().__init__(shape=None)
+
+  def generate_example(self, py_rng: random.Random,
+                       rgn: np.random.RandomState) -> MutableMapping[str, Any]:
+    return {
+        feature_name: generator.generate(py_rng=py_rng, rgn=rgn)
+        for feature_name, generator in self._feature_generators.items()
+    }
+
+  def generate(self, py_rng: random.Random,
+               rgn: np.random.RandomState) -> List[MutableMapping[str, Any]]:
+    return [
+        self.generate_example(py_rng, rgn)
+        for _ in range(self._num_sub_examples)
+    ]
+
+  def __repr__(self):
+    return f'DatasetGenerator(feature_generators={self._feature_generators})'
+
+
+def data_generator_for(
+    feature: features_lib.FeatureConnector,
+    num_sub_examples: int = 1,
+    custom_generators: Optional[Mapping[str, DataGenerator]] = None
+) -> DataGenerator:
+  """..."""
+  if isinstance(feature, features_lib.Sequence):
+    return DatasetGenerator(
+        feature,
+        num_sub_examples=num_sub_examples,
+        custom_generators=custom_generators)
+
+  shape = feature.get_tensor_info().shape
+  dtype = feature.get_tensor_info().dtype
+  if isinstance(feature, features_lib.ClassLabel):
+    return IntInRangeGenerator(
+        shape=shape, max_value=feature.num_classes, dtype=dtype)
+  if isinstance(feature, features_lib.Text) and feature.vocab_size:
+    return IntInRangeGenerator(
+        shape=shape, max_value=feature.vocab_size, dtype=dtype)
+
+  if dtype.is_integer:
+    # shape = (4,)
+    return IntInRangeGenerator(shape=shape, dtype=dtype)
+  elif dtype.is_floating:
+    return FloatGenerator(shape=shape, dtype=dtype)
+  elif dtype.is_bool:
+    return BoolGenerator(shape=shape, dtype=dtype)
+  elif dtype == tf.string:
+    return StringGenerator(shape=shape)
+  raise ValueError('Fake generation not supported for {}'.format(dtype))
+
+
 class RandomFakeGenerator(object):
   """Generator of fake examples randomly and deterministically generated."""
 
-  def __init__(self,
-               features,
-               num_examples: int,
-               num_sub_examples: int = 1,
-               seed: int = 0):
+  def __init__(
+      self,
+      features,
+      num_examples: int,
+      num_sub_examples: int = 1,
+      seed: int = 0,
+      custom_generators: Optional[Mapping[str, DataGenerator]] = None,
+  ):
+    self._data_generator = DatasetGenerator(
+        features,
+        num_sub_examples=num_sub_examples,
+        custom_generators=custom_generators)
+    print(f'DEBUG: Created data generator {self._data_generator}')
     self._rgn = np.random.RandomState(seed)  # Could use the split name as seed
     self._py_rng = random.Random(seed)
     self._features = features
     self._num_examples = num_examples
     self._num_sub_examples = num_sub_examples
 
-  def _generate_random_string_array(self, shape):
-    """Generates an array of random strings."""
-
-    def rand_str():
-      return ''.join(
-          self._rgn.choice(
-              list(' abcdefghij'), size=(self._py_rng.randint(10, 20))))
-
-    if not shape:
-      return rand_str()
-
-    return np.array([rand_str() for _ in range(np.prod(shape, dtype=np.int32))
-                    ]).reshape(shape)
-
-  def _generate_random_obj(self, feature, tensor_info):
-    """Generates a random tensor for a single feature."""
-    # TODO(tfds): Could improve the fake generatiion:
-    # * Use the feature statistics (min, max)
-    # * For Sequence features
-    # * For Text
-
-    # First we deal with the case of sub-datasets:
-    if isinstance(feature, features_lib.Dataset):
-      # For sub-datasets self._num_sub_examples examples are generated.
-      generator = RandomFakeGenerator(
-          feature.feature,
-          num_examples=self._num_sub_examples,
-          num_sub_examples=1)
-      # Returns the list of examples in the nested dataset.
-      return list(generator)
-
-    shape = [  # Fill dynamic shape with random values
-        self._rgn.randint(5, 50) if s is None else s for s in tensor_info.shape
-    ]
-    if isinstance(feature, features_lib.ClassLabel):
-      max_value = feature.num_classes
-    elif isinstance(feature, features_lib.Text) and feature.vocab_size:
-      max_value = feature.vocab_size
-    else:
-      max_value = 255
-
-    # We cast the data to make sure `encode_example` don't raise errors
-    dtype = tensor_info.dtype
-    # Generate some random values, depending on the dtype
-    if dtype.is_integer:
-      return self._rgn.randint(0, max_value, shape).astype(dtype.as_numpy_dtype)
-    elif dtype.is_floating:
-      return self._rgn.random_sample(shape).astype(dtype.as_numpy_dtype)
-    elif dtype.is_bool:
-      return (self._rgn.random_sample(shape) < .5).astype(dtype.as_numpy_dtype)
-    elif dtype == tf.string:
-      return self._generate_random_string_array(shape)
-    raise ValueError('Fake generation not supported for {}'.format(dtype))
-
-  def _generate_example(self):
-    """Generate the next example."""
-    root_feature = self._features
-    flat_features = root_feature._flatten(root_feature)  # pylint: disable=protected-access
-    flat_tensor_info = root_feature._flatten(root_feature.get_tensor_info())  # pylint: disable=protected-access
-    flat_objs = [
-        self._generate_random_obj(feature, tensor_info)
-        for feature, tensor_info in zip(flat_features, flat_tensor_info)
-    ]
-    return root_feature._nest(flat_objs)  # pylint: disable=protected-access
-
   def __iter__(self):
     """Yields all fake examples."""
     for _ in range(self._num_examples):
-      yield self._generate_example()
+      example = self._data_generator.generate_example(
+          py_rng=self._py_rng, rgn=self._rgn)
+      print(f'DEBUG: Generating example: {example}')
+      yield example
 
 
 class EncodedRandomFakeGenerator(RandomFakeGenerator):
